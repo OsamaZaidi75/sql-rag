@@ -37,7 +37,7 @@ class VectorStore:
             try:
                 import ollama
                 test_resp = ollama.embed(model=self.ollama_model, input="schema test")
-                embeddings = getattr(test_resp, "embeddings", None) or test_resp.get("embeddings")
+                embeddings = getattr(test_resp, "embeddings", None) or (test_resp.get("embeddings") if isinstance(test_resp, dict) else None)
                 if embeddings and len(embeddings) > 0:
                     self.active_backend = "ollama"
                     return
@@ -67,14 +67,17 @@ class VectorStore:
             try:
                 import ollama
                 resp = ollama.embed(model=self.ollama_model, input=texts)
-                raw_emb = getattr(resp, "embeddings", None) or resp.get("embeddings")
-                arr = np.array(raw_emb, dtype=np.float32)
-                # Normalize for cosine similarity
-                norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-9
-                return arr / norms
+                raw_emb = getattr(resp, "embeddings", None) or (resp.get("embeddings") if isinstance(resp, dict) else None)
+                if raw_emb is not None:
+                    arr = np.array(raw_emb, dtype=np.float32)
+                    # Normalize for cosine similarity
+                    norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-9
+                    return arr / norms
             except Exception:
                 # Fallback to TF-IDF
                 self.active_backend = "tfidf"
+                if self.chunks:
+                    self.build_index()
 
         if self.active_backend == "sentence-transformers":
             try:
@@ -85,6 +88,8 @@ class VectorStore:
                 return np.array(arr, dtype=np.float32)
             except Exception:
                 self.active_backend = "tfidf"
+                if self.chunks:
+                    self.build_index()
 
         # TF-IDF Fallback
         from sklearn.feature_extraction.text import TfidfVectorizer
