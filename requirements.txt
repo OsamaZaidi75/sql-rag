@@ -6,3 +6,6 @@ pandas>=2.0.0
 plotly>=5.18.0
 ollama>=0.3.0
 pytest>=7.4.0
+sqlglot>=25.0.0
+rank-bm25>=0.2.2
+faker>=20.0.0
