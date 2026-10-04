@@ -276,12 +276,23 @@ def get_full_database_schema(db_path: str) -> Dict[str, Any]:
     return schema_map
 
 
-def format_schema_for_llm(schema_map: Dict[str, Any], include_samples: bool = True) -> str:
-    """Formats the schema into a concise, high-signal representation for LLM context."""
+def format_schema_for_llm(
+    schema_map: Dict[str, Any],
+    include_samples: bool = True,
+    only_tables: Optional[List[str]] = None,
+) -> str:
+    """Formats the schema into a concise, high-signal representation for LLM context.
+
+    When ``only_tables`` is given, only those tables are included — this is what
+    makes retrieval load-bearing on large databases instead of dumping the whole
+    schema into every prompt.
+    """
     lines = []
     lines.append("=== DATABASE SCHEMA (SQLite) ===")
 
-    for table_name, details in schema_map.items():
+    tables = [t for t in schema_map if only_tables is None or t in only_tables]
+    for table_name in tables:
+        details = schema_map[table_name]
         col_desc = []
         for c in details["columns"]:
             pk_str = " PRIMARY KEY" if c["is_pk"] else ""
@@ -331,24 +342,179 @@ def validate_sql_safety(sql: str) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
-def execute_safe_query(db_path: str, sql: str, max_rows: int = 500) -> Tuple[pd.DataFrame, str, float]:
+def _read_only_authorizer(action, arg1, arg2, db_name, source):
+    """SQLite authorizer callback: allow only read operations, deny everything else.
+
+    This is the bulletproof layer beneath the keyword validator — even if a
+    crafted query slips past the regex checks, SQLite itself refuses the write.
     """
-    Executes a read-only SQL query against SQLite with timing and safety checks.
+    allowed = {
+        sqlite3.SQLITE_SELECT,
+        sqlite3.SQLITE_READ,
+        sqlite3.SQLITE_FUNCTION,
+        sqlite3.SQLITE_RECURSIVE,
+        sqlite3.SQLITE_TRANSACTION,
+        sqlite3.SQLITE_SAVEPOINT,
+    }
+    return sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY
+
+
+def ensure_limit(sql: str, max_rows: int) -> str:
+    """Guarantees the query cannot return more than ``max_rows`` rows.
+
+    Uses sqlglot to inject a LIMIT clause when the query doesn't already have
+    one; falls back to a regex check + append when sqlglot is unavailable.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        parsed = sqlglot.parse_one(sql, read="sqlite")
+        target = parsed
+        if isinstance(parsed, exp.Union):
+            # apply to each branch of a UNION
+            changed = False
+            for branch in parsed.find_all(exp.Select):
+                if branch.args.get("limit") is None:
+                    branch.set("limit", exp.Limit(expression=exp.Literal.number(max_rows)))
+                    changed = True
+            return parsed.sql(dialect="sqlite") if changed else sql
+        if isinstance(target, exp.Select) and target.args.get("limit") is None:
+            target.set("limit", exp.Limit(expression=exp.Literal.number(max_rows)))
+            return target.sql(dialect="sqlite")
+        return sql
+    except Exception:
+        pass
+
+    # Fallback: regex check + naive append
+    if re.search(r"(?i)\bLIMIT\s+\d+", sql):
+        return sql
+    return sql.strip().rstrip(";") + f" LIMIT {max_rows}"
+
+
+def validate_sql_structure(sql: str, schema_map: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Structurally validates generated SQL against the real schema using sqlglot.
+
+    Catches the most common LLM failure mode — hallucinated table/column names —
+    *before* anything touches the database. Returns (is_valid, [error messages]).
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:
+        return True, []  # parser unavailable: skip gracefully, other layers still apply
+
+    try:
+        parsed = sqlglot.parse_one(sql, read="sqlite")
+    except Exception as e:
+        return False, [f"SQL parse error: {str(e)[:200]}"]
+
+    stmt = parsed
+    if not isinstance(stmt, (exp.Select, exp.Union)):
+        return False, ["Only SELECT-type queries are allowed (no DDL/DML)."]
+
+    errors: List[str] = []
+    known_tables = {t.lower(): t for t in schema_map}
+    col_index = {
+        t.lower(): {c["name"].lower() for c in details["columns"]}
+        for t, details in schema_map.items()
+    }
+
+    # CTE names and SELECT aliases are legal identifiers that aren't real tables/columns
+    cte_names = {c.alias_or_name.lower() for c in parsed.find_all(exp.CTE)}
+    alias_names = {a.alias_or_name.lower() for a in parsed.find_all(exp.Alias)}
+
+    # alias-or-name -> real table (lowercased)
+    scope_tables: Dict[str, str] = {}
+    for tbl in parsed.find_all(exp.Table):
+        real = (tbl.name or "").lower()
+        if not real or real in cte_names:
+            continue
+        if real not in known_tables:
+            errors.append(f"Unknown table `{tbl.name}` (not in database schema).")
+            continue
+        scope_tables[real] = real
+        alias = tbl.alias_or_name.lower()
+        if alias != real:
+            scope_tables[alias] = real
+
+    for col in parsed.find_all(exp.Column):
+        cname = (col.name or "").lower()
+        if not cname or cname == "*" or cname in alias_names:
+            continue
+        ctable = (col.table or "").lower()
+        if ctable:
+            if ctable in cte_names:
+                continue
+            real = scope_tables.get(ctable)
+            if real is None:
+                errors.append(f"Unknown table/alias `{col.table}` in `{col.sql(dialect='sqlite')}`.")
+            elif cname not in col_index.get(real, set()):
+                errors.append(f"Unknown column `{col.name}` in table `{real}`.")
+        else:
+            candidates = [
+                t for t in set(scope_tables.values())
+                if cname in col_index.get(t, set())
+            ]
+            if not candidates:
+                errors.append(
+                    f"Unknown column `{col.name}` (not found in any referenced table)."
+                )
+
+    return (len(errors) == 0), errors
+
+
+def explain_query_plan(db_path: str, sql: str) -> str:
+    """Returns SQLite's EXPLAIN QUERY PLAN output for a query (read-only)."""
+    ok, err = validate_sql_safety(sql)
+    if not ok:
+        return f"Blocked: {err}"
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("EXPLAIN QUERY PLAN " + sql.strip().rstrip(";"))
+        rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            return "(no plan rows returned)"
+        return "\n".join(f"{r[0]}|{r[1]}|{r[2]}|{r[3]}" for r in rows)
+    except Exception as e:
+        return f"EXPLAIN failed: {e}"
+
+
+def execute_safe_query(
+    db_path: str,
+    sql: str,
+    max_rows: int = 500,
+    timeout_secs: float = 15.0,
+) -> Tuple[pd.DataFrame, str, float]:
+    """
+    Executes a read-only SQL query against SQLite with layered safety:
+    keyword validation -> LIMIT injection -> SQLite authorizer (deny writes
+    at the engine level) -> progress-handler query timeout.
     Returns (DataFrame, status_message, latency_ms).
     """
     is_safe, error_msg = validate_sql_safety(sql)
     if not is_safe:
         return pd.DataFrame(), f"⚠️ Security Guardrail: {error_msg}", 0.0
 
+    # Guarantee a row cap even if the LLM forgot LIMIT
+    sql = ensure_limit(sql, max_rows)
+
     start_time = time.perf_counter()
     try:
-        # SQLite connection
         conn = sqlite3.connect(db_path, timeout=5.0)
+        # Bulletproof read-only: deny any write operation at the engine level
+        conn.set_authorizer(_read_only_authorizer)
+        # Kill runaway queries (e.g. accidental CROSS JOINs)
+        deadline = start_time + timeout_secs
 
-        # Add LIMIT if not present and not an aggregation query without limit
-        clean_sql = sql.strip().rstrip(";")
+        def _progress():
+            return 1 if time.perf_counter() > deadline else 0
 
-        df = pd.read_sql_query(clean_sql, conn)
+        conn.set_progress_handler(_progress, 20000)
+
+        df = pd.read_sql_query(sql, conn)
         conn.close()
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
@@ -368,7 +534,11 @@ def execute_safe_query(db_path: str, sql: str, max_rows: int = 500) -> Tuple[pd.
         err_str = str(e)
         # Helpful tips for common SQLite errors
         hint = ""
-        if "no such column" in err_str.lower():
+        if "interrupted" in err_str.lower():
+            hint = f" (query exceeded the {timeout_secs:g}s timeout — try a more selective query)"
+        elif "not authorized" in err_str.lower():
+            hint = " (blocked: query attempted a non-read operation)"
+        elif "no such column" in err_str.lower():
             hint = " (Check table schema for correct column casing and names)"
         elif "no such table" in err_str.lower():
             hint = " (Check available tables in the sidebar schema)"
