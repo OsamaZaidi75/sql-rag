@@ -6,6 +6,21 @@ from core.vector_store import VectorStore, index_database_schema
 from core.rag_engine import generate_sql_query, summarize_results_nl
 
 
+def _ollama_available() -> bool:
+    try:
+        import ollama
+        ollama.list()
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _ollama_available(),
+    reason="Ollama server not reachable; skipping live-LLM e2e tests",
+)
+
+
 @pytest.fixture(scope="module")
 def setup_env():
     init_sample_database(DEFAULT_DB_PATH, force_recreate=True)
