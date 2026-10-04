@@ -24,7 +24,8 @@ def classify_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
             continue
 
         # Try parsing string to date if it looks like date
-        if df[col].dtype == object and len(df) > 0:
+        # (is_string_dtype covers both pandas 2.x `object` and 3.x `str` dtypes)
+        if pd.api.types.is_string_dtype(df[col]) and len(df) > 0:
             sample_val = str(df[col].dropna().iloc[0]) if not df[col].dropna().empty else ""
             if any(char in sample_val for char in ["-", "/"]) and len(sample_val) in (7, 10, 19, 23):
                 try:
