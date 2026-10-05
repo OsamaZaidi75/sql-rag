@@ -35,6 +35,8 @@ Your mission is to translate natural language questions into accurate, performan
    Only join a table if you SELECT a column from it or filter on it — never join a table "just in case".
    A join you don't need can turn a seconds-long query on a 60M-row table into a timeout.
 6. AGGREGATIONS & GROUP BY: Include all non-aggregated SELECT columns in the GROUP BY clause.
+   When counting per entity, GROUP BY its ID column (e.g. `nconst`, `tconst`) — never by a display name like
+   `primary_name` or `primary_title`, which are not unique and silently merge different entities.
 7. DATES: Use SQLite date functions ONLY on TEXT columns containing date strings (e.g. '2023-05-01'):
    - Extract year: `strftime('%Y', date_col)`
    - Extract month: `strftime('%m', date_col)` or `strftime('%Y-%m', date_col)`
