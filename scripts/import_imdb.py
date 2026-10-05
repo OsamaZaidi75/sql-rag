@@ -131,6 +131,7 @@ EXTRAS = {
         "indexes": [
             "CREATE INDEX IF NOT EXISTS idx_principals_nconst ON principals(nconst)",
             "CREATE INDEX IF NOT EXISTS idx_principals_category ON principals(category)",
+            "CREATE INDEX IF NOT EXISTS idx_principals_cat_nconst ON principals(category, nconst)",
         ],
         "mapper": lambda r: (r["tconst"], _to_int(r["ordering"]), r["nconst"],
                              r["category"], _to_text(r["job"]), _to_text(r["characters"])),
