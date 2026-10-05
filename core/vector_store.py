@@ -2,19 +2,48 @@
 Hybrid Vector Store & Schema Indexer for SQL RAG
 Supports multiple embedding backends (Ollama, SentenceTransformers, TF-IDF fallback)
 with automatic failover, batch processing, and normalized cosine similarity search.
+
+Retrieval is genuinely hybrid: dense cosine similarity and BM25 keyword search
+run independently and their ranked lists are fused with Reciprocal Rank Fusion
+(RRF), so exact table/column name matches and semantic matches reinforce
+each other instead of one backend merely replacing the other.
+
+The built index can be persisted to disk and reloaded when the underlying
+database file has not changed (checked via mtime), so restarts don't pay
+the embedding cost again.
 """
 
+import json
 import os
+import pickle
 import re
 import numpy as np
+from pathlib import Path
 from typing import List, Dict, Tuple, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field, asdict
+
+
+def _tokenize(text: str) -> List[str]:
+    """Simple alphanumeric tokenizer shared by BM25 indexing and querying."""
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def rrf_fuse(ranked_id_lists: List[List[int]], k: int = 60) -> List[Tuple[int, float]]:
+    """
+    Reciprocal Rank Fusion over ranked id lists.
+    score(id) = sum(1 / (k + rank)) across lists. Returns (id, score) sorted desc.
+    """
+    scores: Dict[int, float] = {}
+    for ids in ranked_id_lists:
+        for rank, doc_id in enumerate(ids, start=1):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+    return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
 
 
 @dataclass
 class DocumentChunk:
     text: str
-    metadata: Dict[str, Any]
+    metadata: Dict[str, Any] = field(default_factory=dict)
     doc_id: str = ""
 
 
@@ -26,6 +55,7 @@ class VectorStore:
         self.active_backend = "tfidf"
         self._hf_model = None
         self._tfidf_vectorizer = None
+        self._bm25 = None
 
         self.chunks: List[DocumentChunk] = []
         self.embeddings: Optional[np.ndarray] = None
@@ -108,15 +138,24 @@ class VectorStore:
         norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-9
         return arr / norms
 
+    def _embed_query(self, query: str) -> np.ndarray:
+        """Embeds a single query string with the active backend."""
+        if self.active_backend == "tfidf" and self._tfidf_vectorizer is not None:
+            q_vec = self._tfidf_vectorizer.transform([query]).toarray()
+            q_norm = np.linalg.norm(q_vec, axis=1, keepdims=True) + 1e-9
+            return (q_vec / q_norm).astype(np.float32)
+        return self._embed_texts([query])
+
     def add_chunk(self, text: str, metadata: Dict[str, Any], doc_id: str = ""):
         """Adds a document chunk to the vector store buffer."""
         chunk = DocumentChunk(text=text.strip(), metadata=metadata, doc_id=doc_id)
         self.chunks.append(chunk)
 
     def build_index(self):
-        """Computes embeddings for all accumulated chunks."""
+        """Computes embeddings for all accumulated chunks, plus the BM25 index."""
         if not self.chunks:
             self.embeddings = None
+            self._bm25 = None
             return
 
         texts = [chunk.text for chunk in self.chunks]
@@ -136,21 +175,22 @@ class VectorStore:
         else:
             self.embeddings = self._embed_texts(texts)
 
+        # BM25 keyword index over the same chunks (graceful if dep missing)
+        try:
+            from rank_bm25 import BM25Okapi
+            self._bm25 = BM25Okapi([_tokenize(t) for t in texts])
+        except Exception:
+            self._bm25 = None
+
     def search(self, query: str, top_k: int = 5, min_score: float = 0.05) -> List[Tuple[DocumentChunk, float]]:
         """
-        Searches the index for chunks semantically relevant to query.
-        Returns list of (DocumentChunk, similarity_score).
+        Dense/cosine search over the index. Returns list of (DocumentChunk, similarity_score).
+        For fused dense+BM25 retrieval, use search_hybrid().
         """
         if self.embeddings is None or len(self.chunks) == 0:
             return []
 
-        if self.active_backend == "tfidf" and self._tfidf_vectorizer is not None:
-            q_vec = self._tfidf_vectorizer.transform([query]).toarray()
-            q_norm = np.linalg.norm(q_vec, axis=1, keepdims=True) + 1e-9
-            q_emb = (q_vec / q_norm).astype(np.float32)
-        else:
-            q_emb = self._embed_texts([query])
-
+        q_emb = self._embed_query(query)
         if q_emb.shape[0] == 0:
             return []
 
@@ -165,6 +205,144 @@ class VectorStore:
                 results.append((self.chunks[idx], score))
 
         return results
+
+    def search_hybrid(
+        self,
+        query: str,
+        top_k: int = 5,
+        dense_k: int = 25,
+        bm25_k: int = 25,
+        rrf_k: int = 60,
+    ) -> List[Tuple[DocumentChunk, float]]:
+        """
+        Hybrid retrieval: dense cosine ranking and BM25 keyword ranking are
+        fused with Reciprocal Rank Fusion. Returns (chunk, rrf_score) sorted
+        by fused score. Falls back to dense-only when BM25 is unavailable.
+        """
+        if self.embeddings is None or len(self.chunks) == 0:
+            return []
+
+        q_emb = self._embed_query(query)
+        if q_emb.shape[0] == 0:
+            return []
+
+        sims = np.dot(self.embeddings, q_emb[0]).flatten()
+        dense_ids = np.argsort(sims)[::-1][:dense_k].tolist()
+
+        kw_ids: List[int] = []
+        if self._bm25 is not None:
+            try:
+                bm25_scores = self._bm25.get_scores(_tokenize(query))
+                ranked = np.argsort(bm25_scores)[::-1][:bm25_k]
+                kw_ids = [int(i) for i in ranked if bm25_scores[i] > 0]
+            except Exception:
+                kw_ids = []
+
+        ranked_lists = [dense_ids, kw_ids] if kw_ids else [dense_ids]
+        fused = rrf_fuse(ranked_lists, k=rrf_k)[:top_k]
+        return [(self.chunks[i], float(score)) for i, score in fused]
+
+    # -- persistence ----------------------------------------------------
+
+    def save_index(self, base_path: str, db_mtime: Optional[float] = None):
+        """
+        Persists the built index to disk. Files written:
+        ``<base>.npz`` (embeddings), ``<base>.chunks.json`` (chunk data),
+        ``<base>.json`` (manifest), ``<base>.tfidf.pkl`` (TF-IDF vectorizer, if used).
+        """
+        if self.embeddings is None:
+            raise RuntimeError("Cannot save an index that has not been built.")
+
+        base = str(base_path)
+        np.savez_compressed(base + ".npz", embeddings=self.embeddings)
+        with open(base + ".chunks.json", "w", encoding="utf-8") as f:
+            json.dump([asdict(c) for c in self.chunks], f)
+        manifest = {
+            "active_backend": self.active_backend,
+            "embedding_dim": int(self.embeddings.shape[1]),
+            "chunk_count": len(self.chunks),
+            "db_mtime": db_mtime,
+        }
+        with open(base + ".json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+        if self.active_backend == "tfidf" and self._tfidf_vectorizer is not None:
+            with open(base + ".tfidf.pkl", "wb") as f:
+                pickle.dump(self._tfidf_vectorizer, f)
+
+    @classmethod
+    def load_index(cls, base_path: str, **kwargs) -> "VectorStore":
+        """Reloads an index previously written by :meth:`save_index`."""
+        base = str(base_path)
+        with open(base + ".json", encoding="utf-8") as f:
+            manifest = json.load(f)
+        with open(base + ".chunks.json", encoding="utf-8") as f:
+            chunk_dicts = json.load(f)
+
+        store = cls.__new__(cls)
+        store.backend = kwargs.get("backend", "auto")
+        store.ollama_model = kwargs.get("ollama_model", "nomic-embed-text")
+        store.hf_model_name = kwargs.get("hf_model", "BAAI/bge-small-en-v1.5")
+        store.active_backend = manifest.get("active_backend", "tfidf")
+        store._hf_model = None
+        store._tfidf_vectorizer = None
+        store._bm25 = None
+        store.chunks = [DocumentChunk(**c) for c in chunk_dicts]
+        store.embeddings = np.load(base + ".npz")["embeddings"]
+
+        if store.active_backend == "tfidf":
+            tfidf_path = base + ".tfidf.pkl"
+            if os.path.exists(tfidf_path):
+                with open(tfidf_path, "rb") as f:
+                    store._tfidf_vectorizer = pickle.load(f)
+        try:
+            from rank_bm25 import BM25Okapi
+            store._bm25 = BM25Okapi([_tokenize(c.text) for c in store.chunks])
+        except Exception:
+            store._bm25 = None
+        return store
+
+
+def index_cache_path(db_path: str, backend: str, cache_dir: str = "data/index_cache") -> str:
+    """Deterministic cache base path for a database + embedding backend."""
+    stem = Path(db_path).stem
+    safe_backend = re.sub(r"[^a-z0-9_-]", "_", backend.lower())
+    return os.path.join(cache_dir, f"{stem}.{safe_backend}")
+
+
+def get_or_build_index(
+    db_path: str,
+    backend: str = "auto",
+    ollama_embed_model: str = "nomic-embed-text",
+    cache_dir: str = "data/index_cache",
+) -> VectorStore:
+    """
+    Returns a built VectorStore for ``db_path``, loading a cached index from
+    disk when the database file is unchanged (mtime check), otherwise building
+    fresh and caching it.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    base = index_cache_path(db_path, backend, cache_dir)
+    manifest_path = base + ".json"
+    db_mtime = os.path.getmtime(db_path) if os.path.exists(db_path) else None
+
+    if os.path.exists(manifest_path) and db_mtime is not None:
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            if manifest.get("db_mtime") == db_mtime and manifest.get("chunk_count"):
+                return VectorStore.load_index(
+                    base, backend=backend, ollama_model=ollama_embed_model
+                )
+        except Exception:
+            pass  # corrupt/partial cache -> rebuild
+
+    store = VectorStore(backend=backend, ollama_model=ollama_embed_model)
+    index_database_schema(db_path, store)
+    try:
+        store.save_index(base, db_mtime=db_mtime)
+    except Exception:
+        pass  # caching is best-effort; a live index is what matters
+    return store
 
 
 def index_database_schema(db_path: str, vector_store: VectorStore):
@@ -234,13 +412,13 @@ def index_database_schema(db_path: str, vector_store: VectorStore):
         ("Multi-table Join: SELECT t1.name, t2.department_name, t3.amount FROM t1 JOIN t2 ON t1.dept_id = t2.id JOIN t3 ON t1.id = t3.emp_id",
          {"type": "sql_pattern", "category": "join"}),
         ("Top N ranking: SELECT name, salary FROM employees ORDER BY salary DESC LIMIT 5",
-         {"type": "sql_pattern", "category": "top_n"}),
+         {"type": "top_n"}),
         ("Date and Time operations in SQLite: strftime('%Y', date_col) for year, strftime('%Y-%m', date_col) for month, date(date_col) for date",
          {"type": "sql_pattern", "category": "datetime"}),
         ("Conditional counts and sums: SUM(CASE WHEN status = 'Completed' THEN 1 ELSE 0 END) AS completed_count",
          {"type": "sql_pattern", "category": "conditional"}),
     ]
     for p_text, p_meta in query_patterns:
-        vector_store.add_chunk(text=p_text, metadata=p_meta, doc_id=f"pattern_{p_meta['category']}")
+        vector_store.add_chunk(text=p_text, metadata=p_meta, doc_id=f"pattern_{p_meta.get('category', 'misc')}")
 
     vector_store.build_index()

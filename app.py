@@ -20,15 +20,20 @@ from core.database import (
     format_schema_for_llm,
     execute_safe_query,
     load_csv_to_sqlite,
+    validate_sql_structure,
+    explain_query_plan,
     DEFAULT_DB_PATH
 )
 from core.vector_store import (
     VectorStore,
-    index_database_schema
+    get_or_build_index,
 )
+from core.llm import make_llm
 from core.rag_engine import (
     generate_sql_query,
+    generate_sql_query_full,
     auto_repair_sql,
+    repair_sql,
     summarize_results_nl
 )
 from core.visualizer import (
@@ -100,6 +105,14 @@ if "last_summary" not in st.session_state:
     st.session_state.last_summary = ""
 if "db_path" not in st.session_state:
     st.session_state.db_path = DEFAULT_DB_PATH
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "last_tables_used" not in st.session_state:
+    st.session_state.last_tables_used = []
+if "last_rewritten" not in st.session_state:
+    st.session_state.last_rewritten = ""
+if "last_repair_attempts" not in st.session_state:
+    st.session_state.last_repair_attempts = []
 
 
 # --- Helper to list installed Ollama models ---
@@ -121,11 +134,8 @@ def get_installed_ollama_models() -> List[str]:
 # --- Cached Vector Store Resource ---
 @st.cache_resource(show_spinner=False)
 def get_cached_vector_store(db_path: str, backend: str, ollama_embed_model: str) -> VectorStore:
-    """Builds and caches the vector store for a given database path and embedding backend."""
-    vstore = VectorStore(backend=backend, ollama_model=ollama_embed_model)
-    if os.path.exists(db_path):
-        index_database_schema(db_path, vstore)
-    return vstore
+    """Builds the vector store, or loads it from the disk cache when the DB is unchanged."""
+    return get_or_build_index(db_path, backend=backend, ollama_embed_model=ollama_embed_model)
 
 
 # Initialize sample DB on start
@@ -136,20 +146,47 @@ init_sample_database(DEFAULT_DB_PATH)
 with st.sidebar:
     st.markdown("### ⚙️ Engine Settings")
 
-    # Model Selection
-    ollama_models = get_installed_ollama_models()
-    default_model_idx = 0
-    for idx, m in enumerate(ollama_models):
-        if "llama3" in m.lower():
-            default_model_idx = idx
-            break
-
-    selected_model = st.selectbox(
-        "LLM Model (Ollama)",
-        options=ollama_models,
-        index=default_model_idx,
-        help="Local LLM model to generate SQL queries"
+    # LLM Provider Selection
+    llm_provider = st.radio(
+        "LLM Provider",
+        options=["ollama", "cloud"],
+        format_func=lambda x: "Ollama (local, private)" if x == "ollama" else "Cloud (OpenAI-compatible)",
+        help="Local Ollama, or any OpenAI-compatible chat API (e.g. Gemini) for hosted demos",
     )
+
+    cloud_base_url = ""
+    cloud_api_key = ""
+    if llm_provider == "ollama":
+        # Model Selection
+        ollama_models = get_installed_ollama_models()
+        default_model_idx = 0
+        for idx, m in enumerate(ollama_models):
+            if "llama3" in m.lower():
+                default_model_idx = idx
+                break
+
+        selected_model = st.selectbox(
+            "LLM Model (Ollama)",
+            options=ollama_models,
+            index=default_model_idx,
+            help="Local LLM model to generate SQL queries"
+        )
+    else:
+        cloud_base_url = st.text_input(
+            "API Base URL",
+            value="https://generativelanguage.googleapis.com/v1beta/openai/",
+            help="Any OpenAI-compatible /chat/completions endpoint",
+        )
+        cloud_api_key = st.text_input(
+            "API Key",
+            type="password",
+            help="Kept in memory only. On Streamlit Cloud, prefer st.secrets['LLM_API_KEY'].",
+        )
+        selected_model = st.text_input(
+            "Model",
+            value="gemini-flash-latest",
+            help="Model name at the cloud endpoint",
+        )
 
     # Embedding Backend Selection
     embedding_backend = st.selectbox(
@@ -244,6 +281,26 @@ with st.sidebar:
         st.warning(f"Database not found at `{st.session_state.db_path}`")
 
 
+# --- LLM client factory (Streamlit-secrets aware) ---
+def _secret(name: str, default: str = "") -> str:
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def get_llm_client():
+    """Builds the LLM client for the provider chosen in the sidebar."""
+    if llm_provider == "cloud":
+        return make_llm(
+            provider="cloud",
+            model=selected_model or _secret("LLM_MODEL", "gemini-flash-latest"),
+            base_url=cloud_base_url or _secret("LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
+            api_key=cloud_api_key or _secret("LLM_API_KEY", ""),
+        )
+    return make_llm(provider="ollama", model=selected_model)
+
+
 # --- Main Application Area ---
 st.markdown('<div class="main-header">⚡ SQL RAG Studio</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Convert natural language questions into accurate SQL, inspect schemas with semantic vector search, and visualize data instantly.</div>', unsafe_allow_html=True)
@@ -290,54 +347,74 @@ with st.form("query_form", clear_on_submit=False):
         placeholder="e.g. 'Show the total sales revenue by product category ordered by revenue descending'",
         height=90
     )
-    col_submit, col_summary, col_repair = st.columns([2, 2, 2])
+    col_submit, col_summary, col_repair, col_follow = st.columns([2, 2, 2, 2])
     with col_submit:
         submitted = st.form_submit_button("🚀 Generate & Execute SQL", type="primary", use_container_width=True)
     with col_summary:
         generate_summary = st.checkbox("Generate Natural Language Summary", value=True)
     with col_repair:
         enable_auto_repair = st.checkbox("Auto-repair SQL on error", value=True)
+    with col_follow:
+        enable_followups = st.checkbox(
+            "Conversational follow-ups",
+            value=True,
+            help="Resolve follow-up questions ('now only 2023') against chat history",
+        )
 
 # Process Query
 if submitted and user_query.strip():
     st.session_state.current_query = user_query.strip()
+    llm = get_llm_client()
+    history = st.session_state.chat_history if enable_followups else None
 
     with st.spinner("🤖 Retrieving schema context & generating SQL query..."):
         t0 = time.perf_counter()
-        sql, retrieved_chunks, raw_llm = generate_sql_query(
+        full = generate_sql_query_full(
             nl_query=user_query.strip(),
             db_path=current_db,
             vector_store=vector_store,
-            model_name=selected_model,
             top_k=top_k,
-            temperature=temperature
+            temperature=temperature,
+            history=history,
+            llm=llm,
         )
         gen_time_ms = (time.perf_counter() - t0) * 1000.0
 
+    sql = full["sql"]
     st.session_state.last_sql = sql
-    st.session_state.last_retrieved = retrieved_chunks
+    st.session_state.last_retrieved = full["chunks"]
+    st.session_state.last_tables_used = full["tables_used"]
+    st.session_state.last_rewritten = full["rewritten_question"]
+    st.session_state.last_repair_attempts = []
+    repair_attempts: list = []
 
     if not sql:
-        st.error(f"Failed to generate SQL: {raw_llm}")
+        st.error(f"Failed to generate SQL: {full['raw_llm_response']}")
     else:
-        # Execute Query
-        with st.spinner("⚡ Executing SQL query on database..."):
-            df, status_msg, exec_latency = execute_safe_query(current_db, sql)
+        # Structural pre-check: catch hallucinated tables/columns before execution
+        schema_map = get_full_database_schema(current_db)
+        struct_ok, struct_errors = validate_sql_structure(sql, schema_map)
+        if not struct_ok:
+            df = pd.DataFrame()
+            status_msg = "❌ Structure check failed: " + "; ".join(struct_errors)
+            exec_latency = 0.0
+        else:
+            with st.spinner("⚡ Executing SQL query on database..."):
+                df, status_msg, exec_latency = execute_safe_query(current_db, sql)
 
-            # Auto-repair loop if execution failed
-            if "❌" in status_msg and enable_auto_repair:
-                st.warning(f"Initial query encountered error: {status_msg}. Attempting AI auto-repair...")
-                repaired_sql, repair_raw = auto_repair_sql(
-                    original_query=user_query.strip(),
-                    failed_sql=sql,
-                    error_message=status_msg,
-                    db_path=current_db,
-                    model_name=selected_model
-                )
-                if repaired_sql and repaired_sql != sql:
-                    st.info(f"Retrying with repaired SQL...")
-                    df, status_msg, exec_latency = execute_safe_query(current_db, repaired_sql)
-                    st.session_state.last_sql = repaired_sql
+        # Auto-repair retry loop if execution failed
+        if (status_msg.startswith("❌") or status_msg.startswith("⚠️")) and enable_auto_repair:
+            st.warning(f"Initial query failed: {status_msg}. Attempting AI auto-repair...")
+            sql, df, status_msg, repair_attempts = repair_sql(
+                original_query=user_query.strip(),
+                failed_sql=sql,
+                error_message=status_msg,
+                db_path=current_db,
+                llm=llm,
+                max_attempts=3,
+            )
+            st.session_state.last_sql = sql
+            st.session_state.last_repair_attempts = repair_attempts
 
         st.session_state.last_df = df
         st.session_state.last_status = status_msg
@@ -349,7 +426,7 @@ if submitted and user_query.strip():
                     user_query=user_query.strip(),
                     sql=st.session_state.last_sql,
                     df=df,
-                    model_name=selected_model
+                    llm=llm,
                 )
                 st.session_state.last_summary = summary
         else:
@@ -361,10 +438,18 @@ if submitted and user_query.strip():
             "query": user_query.strip(),
             "sql": st.session_state.last_sql,
             "rows": len(df),
-            "status": "Success" if "✅" in status_msg else "Error",
+            "status": "Success" if (status_msg.startswith("✅") or status_msg.startswith("ℹ️")) else "Error",
             "gen_time_ms": gen_time_ms,
-            "exec_time_ms": exec_latency
+            "exec_time_ms": exec_latency,
+            "repairs": len(repair_attempts),
         })
+
+        # Conversational memory for follow-up resolution
+        if enable_followups:
+            st.session_state.chat_history.append({"role": "user", "content": user_query.strip()})
+            st.session_state.chat_history.append(
+                {"role": "assistant", "content": f"Ran SQL: {st.session_state.last_sql}"}
+            )
 
 
 # --- Results Section ---
@@ -378,6 +463,16 @@ if st.session_state.last_sql:
         st.warning(st.session_state.last_status)
     else:
         st.error(st.session_state.last_status)
+
+    # Follow-up rewrite + pruned-tables context
+    if st.session_state.last_rewritten and st.session_state.last_rewritten != st.session_state.current_query:
+        st.caption(f"🔁 Follow-up interpreted as: “{st.session_state.last_rewritten}”")
+    if st.session_state.last_tables_used:
+        badges = " ".join(
+            f'<span class="metric-badge badge-info">📦 {t}</span>'
+            for t in st.session_state.last_tables_used
+        )
+        st.markdown(f"Tables used: {badges}", unsafe_allow_html=True)
 
     # Optional NL Summary Box
     if st.session_state.last_summary:
@@ -457,6 +552,10 @@ if st.session_state.last_sql:
         st.markdown("#### Generated SQL Query")
         st.code(st.session_state.last_sql, language="sql")
 
+        with st.expander("🧭 Query Plan (EXPLAIN QUERY PLAN)"):
+            st.caption("How SQLite will execute this query — useful for spotting full table scans.")
+            st.code(explain_query_plan(current_db, st.session_state.last_sql), language="text")
+
         st.markdown("#### ✏️ Interactive SQL Editor & Runner")
         st.caption("You can modify the SQL below and re-run it directly against the active database:")
         edited_sql = st.text_area("Edit SQL:", value=st.session_state.last_sql, height=130, key="edited_sql_box")
@@ -479,10 +578,19 @@ if st.session_state.last_sql:
         else:
             st.write("No vector chunks retrieved.")
 
-        st.markdown("#### 📋 Full Schema Injected into LLM")
-        with st.expander("View Full Schema Prompt"):
+        st.markdown("#### 📋 Schema Sent to the LLM (pruned to relevant tables)")
+        with st.expander("View Schema Prompt"):
             schema_map = get_full_database_schema(current_db)
             st.text(format_schema_for_llm(schema_map))
+
+        if st.session_state.last_repair_attempts:
+            st.markdown("#### 🔧 Auto-Repair Attempts")
+            for a in st.session_state.last_repair_attempts:
+                status = "✅ fixed" if a["error"] is None else "❌ failed"
+                with st.expander(f"Attempt {a['attempt']} — {status}"):
+                    st.code(a["sql"], language="sql")
+                    if a["error"]:
+                        st.caption(a["error"])
 
     # --- TAB 4: Query History ---
     with tab_history:
