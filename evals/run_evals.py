@@ -13,11 +13,14 @@ Modes:
 
 Run:  python -m evals.run_evals --mock
       python -m evals.run_evals --model llama3.1 --top-k 5
+      python -m evals.run_evals --mock --junit reports/junit.xml
 """
 import argparse
 import json
 import os
 import sys
+import time
+import xml.etree.ElementTree as ET
 from collections import Counter
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -70,6 +73,8 @@ def main() -> int:
     parser.add_argument("--api-key", default="")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
+    parser.add_argument("--junit", default=None, metavar="PATH",
+                        help="write JUnit XML report to PATH for CI integration")
     args = parser.parse_args()
 
     with open(GOLDEN_PATH, encoding="utf-8") as f:
@@ -86,11 +91,13 @@ def main() -> int:
                        base_url=args.base_url, api_key=args.api_key)
 
     passed = 0
+    cases = []  # (qid, ok, detail, elapsed_s) for the JUnit report
     print(f"{'id':28s} {'rows':>6s}  result")
     print("-" * 48)
     for item in golden:
         qid, question = item["id"], item["question"]
         expected = rows_to_counter(item["expected_rows"])
+        t0 = time.perf_counter()
         try:
             sql, _chunks, _raw = generate_sql_query(
                 nl_query=question, db_path=args.db, vector_store=vstore,
@@ -101,14 +108,45 @@ def main() -> int:
             detail = f"{len(df)} rows"
         except Exception as e:
             ok, detail = False, f"error: {str(e)[:60]}"
+        elapsed = time.perf_counter() - t0
         passed += ok
+        cases.append((qid, bool(ok), detail, elapsed))
         print(f"{qid:28s} {detail:>6s}  {'PASS' if ok else 'FAIL'}")
 
     n = len(golden)
     acc = 100.0 * passed / n if n else 0.0
     print("-" * 48)
     print(f"Execution accuracy: {passed}/{n} ({acc:.1f}%)  [llm={llm.label}]")
+
+    if args.junit:
+        write_junit(args.junit, cases, llm.label)
+        print(f"JUnit report written to {args.junit}")
+
     return 0 if passed == n else 1
+
+
+def write_junit(path: str, cases: list, llm_label: str) -> None:
+    """Write per-question results as JUnit XML (stdlib only, CI-friendly)."""
+    suite = ET.Element("testsuite", {
+        "name": f"sql-rag-golden-evals[{llm_label}]",
+        "tests": str(len(cases)),
+        "failures": str(sum(1 for _, ok, _, _ in cases if not ok)),
+        "errors": "0",
+        "skipped": "0",
+    })
+    for qid, ok, detail, elapsed in cases:
+        case = ET.SubElement(suite, "testcase", {
+            "classname": "golden",
+            "name": qid,
+            "time": f"{elapsed:.3f}",
+        })
+        if not ok:
+            failure = ET.SubElement(case, "failure", {"message": detail})
+            failure.text = f"execution mismatch for {qid}: {detail}"
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tree = ET.ElementTree(suite)
+    ET.indent(tree, space="  ")
+    tree.write(path, encoding="utf-8", xml_declaration=True)
 
 
 if __name__ == "__main__":
