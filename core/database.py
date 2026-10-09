@@ -9,7 +9,7 @@ import re
 import time
 import sqlite3
 import pandas as pd
-from typing import List, Dict, Tuple, Any, Optional
+from typing import List, Dict, Tuple, Any, Optional, Union, BinaryIO
 from pathlib import Path
 
 
@@ -164,7 +164,7 @@ def init_sample_database(db_path: str = DEFAULT_DB_PATH, force_recreate: bool = 
     return db_path
 
 
-def load_csv_to_sqlite(csv_file, table_name: str = "uploaded_data", db_path: str = "data/custom.db") -> str:
+def load_csv_to_sqlite(csv_file: Union[str, Path, BinaryIO], table_name: str = "uploaded_data", db_path: str = "data/custom.db") -> str:
     """Imports an uploaded CSV file into a SQLite database."""
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     df = pd.read_csv(csv_file)
@@ -342,7 +342,13 @@ def validate_sql_safety(sql: str) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
-def _read_only_authorizer(action, arg1, arg2, db_name, source):
+def _read_only_authorizer(
+    action: int,
+    arg1: Optional[str],
+    arg2: Optional[str],
+    db_name: Optional[str],
+    source: Optional[str],
+) -> int:
     """SQLite authorizer callback: allow only read operations, deny everything else.
 
     This is the bulletproof layer beneath the keyword validator — even if a
@@ -509,7 +515,7 @@ def execute_safe_query(
         # Kill runaway queries (e.g. accidental CROSS JOINs)
         deadline = start_time + timeout_secs
 
-        def _progress():
+        def _progress() -> int:
             return 1 if time.perf_counter() > deadline else 0
 
         conn.set_progress_handler(_progress, 20000)
