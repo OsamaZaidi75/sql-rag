@@ -48,7 +48,24 @@ class DocumentChunk:
 
 
 class VectorStore:
+    """Hybrid dense + BM25 vector store for schema chunks.
+
+    Embedding backends are tried in order (Ollama, then SentenceTransformers,
+    then a TF-IDF char-ngram fallback) so the store works fully offline.
+    All backends return L2-normalized vectors, so ``np.dot`` gives cosine
+    similarity directly. Dense rankings and BM25 keyword rankings can be
+    fused with :meth:`search_hybrid` via Reciprocal Rank Fusion.
+    """
+
     def __init__(self, backend: str = "auto", ollama_model: str = "nomic-embed-text", hf_model: str = "BAAI/bge-small-en-v1.5"):
+        """Initialize the store and pick the best available embedding backend.
+
+        Args:
+            backend: One of ``"auto"``, ``"ollama"``, ``"sentence-transformers"``,
+                or ``"tfidf"``. ``"auto"`` tries them in order and falls back.
+            ollama_model: Ollama embedding model used when backend is ollama.
+            hf_model: HuggingFace model id used for sentence-transformers.
+        """
         self.backend = backend  # 'ollama', 'sentence-transformers', 'tfidf', 'auto'
         self.ollama_model = ollama_model
         self.hf_model_name = hf_model
@@ -147,12 +164,23 @@ class VectorStore:
         return self._embed_texts([query])
 
     def add_chunk(self, text: str, metadata: Dict[str, Any], doc_id: str = ""):
-        """Adds a document chunk to the vector store buffer."""
+        """Stage a document chunk in the in-memory buffer (unindexed until :meth:`build_index`).
+
+        Args:
+            text: Chunk content; leading/trailing whitespace is stripped.
+            metadata: Arbitrary labels (e.g. ``{"type": "column", "table": ...}``).
+            doc_id: Optional stable identifier used in retrieval results.
+        """
         chunk = DocumentChunk(text=text.strip(), metadata=metadata, doc_id=doc_id)
         self.chunks.append(chunk)
 
     def build_index(self):
-        """Computes embeddings for all accumulated chunks, plus the BM25 index."""
+        """Compute embeddings for all staged chunks and build the BM25 index.
+
+        TF-IDF backends refit the vectorizer on the full chunk set; dense
+        backends encode through the active embedding engine. Safe to call
+        again after adding more chunks (it rebuilds from scratch).
+        """
         if not self.chunks:
             self.embeddings = None
             self._bm25 = None
