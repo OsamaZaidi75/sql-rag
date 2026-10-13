@@ -1,11 +1,18 @@
+# Dependency snapshot, 2026-10-13 (Python 3.12.3).
+# `==` pins are the exact `pip freeze` versions the daily test suite
+# (pytest tests/ → 60 passed, 2 skipped) and golden eval
+# (evals/run_evals.py --mock → 30/30) are verified against.
+# streamlit and sentence-transformers keep lower bounds: their wheels are
+# too heavy for the test venv, so they aren't installed when tests run.
+# Pin them too if you need a byte-reproducible UI/embedding setup.
 streamlit>=1.38.0
 sentence-transformers>=2.2.0
-scikit-learn>=1.3.0
-numpy>=1.24.0
-pandas>=2.0.0
-plotly>=5.18.0
-ollama>=0.3.0
-pytest>=7.4.0
-sqlglot>=25.0.0
-rank-bm25>=0.2.2
-faker>=20.0.0
+scikit-learn==1.9.1
+numpy==2.5.3
+pandas==3.0.6
+plotly==7.1.0
+ollama==0.6.3
+pytest==9.1.1
+sqlglot==30.21.0
+rank-bm25==0.2.2
+faker==40.41.0
