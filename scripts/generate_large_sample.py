@@ -4,9 +4,9 @@ Generates a larger synthetic enterprise database for scale/performance demos.
 Creates data/large_sample.db with the same 4-table schema as the sample DB but
 ~17k rows (12 departments, 1,500 employees, 150 projects, 15,000 sales
 transactions across 2022-2024), so charts, aggregations, and query latency
-feel real. Deterministic (seeded) so results are reproducible.
+feel real. Deterministic (seeded via --seed, default 42) so results are reproducible.
 
-Run:  python scripts/generate_large_sample.py [--db data/large_sample.db]
+Run:  python scripts/generate_large_sample.py [--db data/large_sample.db] [--seed 42]
 """
 import argparse
 import os
@@ -57,11 +57,17 @@ def main() -> None:
     parser.add_argument("--employees", type=int, default=1500)
     parser.add_argument("--projects", type=int, default=150)
     parser.add_argument("--sales", type=int, default=15000)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=SEED,
+        help=f"random seed for Faker/random; same seed => identical dataset (default {SEED})",
+    )
     args = parser.parse_args()
 
     fake = Faker()
-    Faker.seed(SEED)
-    random.seed(SEED)
+    Faker.seed(args.seed)
+    random.seed(args.seed)
 
     os.makedirs(os.path.dirname(args.db) or ".", exist_ok=True)
     if os.path.exists(args.db):
