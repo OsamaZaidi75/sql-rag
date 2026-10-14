@@ -43,6 +43,10 @@ from core.visualizer import (
 )
 
 
+# Result-set size above which the UI shows a safety hint before rendering.
+LARGE_RESULT_THRESHOLD = 10_000
+
+
 # --- Streamlit Page Configuration ---
 st.set_page_config(
     page_title="SQL RAG Studio",
@@ -500,6 +504,12 @@ if st.session_state.last_sql:
                 st.metric("Numeric Metrics", len(num_cols))
 
             # Interactive DataFrame
+            if len(df) > LARGE_RESULT_THRESHOLD:
+                st.warning(
+                    f"⚠️ Large result set: {len(df):,} rows returned. "
+                    "Rendering everything may be slow — refine your question "
+                    "with filters or a LIMIT to narrow it down."
+                )
             st.dataframe(df, use_container_width=True)
 
             # Export Buttons
