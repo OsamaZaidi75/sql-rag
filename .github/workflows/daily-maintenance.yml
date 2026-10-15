@@ -1,0 +1,54 @@
+name: daily-maintenance
+on:
+  schedule:
+    - cron: '30 3 * * *'  # 09:00 IST daily
+  workflow_dispatch:
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test deps
+        run: pip install pytest pandas numpy scikit-learn sqlglot rank-bm25 faker plotly ollama
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -q 2>&1 | tee /tmp/pytest.log
+          echo "PYTEST_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      - name: Run golden eval (mock)
+        run: |
+          python -m evals.run_evals --mock 2>&1 | tee /tmp/eval.log
+          echo "EVAL_EXIT=${PIPESTATUS[0]}" >> $GITHUB_ENV
+
+      - name: Write daily report
+        run: |
+          mkdir -p reports/daily
+          DATE=$(date +%F)
+          PYTEST_SUMMARY=$(grep -E '[0-9]+ passed' /tmp/pytest.log | tail -1 | xargs)
+          EVAL_SUMMARY=$(grep -Eo '[0-9]+/[0-9]+' /tmp/eval.log | tail -1)
+          {
+            echo "# Daily maintenance — $DATE"
+            echo ""
+            echo "- pytest: $PYTEST_SUMMARY (exit $PYTEST_EXIT)"
+            echo "- golden eval (mock): $EVAL_SUMMARY (exit $EVAL_EXIT)"
+            echo "- python: $(python --version 2>&1)"
+            echo "- run: scheduled GitHub Actions (ubuntu-latest)"
+          } > reports/daily/$DATE.md
+          cat reports/daily/$DATE.md
+
+      - name: Commit report
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reports/daily/
+          git diff --cached --quiet || git commit -m "daily: automated test + eval report ($(date +%F))"
+          git push
