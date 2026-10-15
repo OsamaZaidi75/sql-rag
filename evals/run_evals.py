@@ -14,6 +14,7 @@ Modes:
 Run:  python -m evals.run_evals --mock
       python -m evals.run_evals --model llama3.1 --top-k 5
       python -m evals.run_evals --mock --junit reports/junit.xml
+      python -m evals.run_evals --mock --fail-under 95   # CI gate: fail unless accuracy >= 95%
 """
 import argparse
 import json
@@ -64,6 +65,23 @@ class MockLLM:
         return "```sql\nSELECT 1\n```"
 
 
+def gate_exit(passed: int, total: int, fail_under: float | None) -> int:
+    """Map eval results to a process exit code.
+
+    No gate: exit 0 only if every question passed.
+    --fail-under PCT: exit 0 iff execution accuracy >= PCT (CI gate); a few
+    individual failures are tolerated as long as the threshold is met.
+    """
+    if fail_under is None:
+        return 0 if passed == total else 1
+    acc = 100.0 * passed / total if total else 0.0
+    if acc < fail_under:
+        print(f"FAIL: accuracy {acc:.1f}% is below --fail-under {fail_under}%")
+        return 1
+    print(f"OK: accuracy {acc:.1f}% meets --fail-under {fail_under}%")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="SQL RAG execution-accuracy evals")
     parser.add_argument("--mock", action="store_true", help="use deterministic mock LLM (harness self-test)")
@@ -75,6 +93,9 @@ def main() -> int:
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
     parser.add_argument("--junit", default=None, metavar="PATH",
                         help="write JUnit XML report to PATH for CI integration")
+    parser.add_argument("--fail-under", type=float, default=None, metavar="PCT",
+                        help="CI gate: exit non-zero unless execution accuracy is "
+                             "at least PCT%% (e.g. --fail-under 95)")
     args = parser.parse_args()
 
     with open(GOLDEN_PATH, encoding="utf-8") as f:
@@ -122,7 +143,7 @@ def main() -> int:
         write_junit(args.junit, cases, llm.label)
         print(f"JUnit report written to {args.junit}")
 
-    return 0 if passed == n else 1
+    return gate_exit(passed, n, args.fail_under)
 
 
 def write_junit(path: str, cases: list, llm_label: str) -> None:
