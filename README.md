@@ -146,6 +146,28 @@ keys so joins don't lose a table, and only that pruned DDL reaches the LLM.
 The vector index persists to `data/index_cache/` and rebuilds only when the DB
 file changes.
 
+**Database-side: composite indexes for large tables.** The RAG layer can only
+be as fast as the SQL it generates, so `scripts/import_imdb.py` (which builds
+the multi-million-row IMDb stress DBs) creates targeted indexes alongside each
+table. The motivating case: `principals` (~60M rows, cast & crew per title).
+The query *"top actor by movie count"* filters `WHERE category = 'actor'` and
+groups by `nconst` — with only the single-column indexes
+(`idx_principals_nconst`, `idx_principals_category`) it blew past the 15s
+query timeout. Adding the composite
+
+```sql
+CREATE INDEX idx_principals_cat_nconst ON principals(category, nconst);
+```
+
+fixed it: the equality column goes first, the grouped/joined column second, so
+filter + group-by are served from one index (SQLite's leftmost-prefix rule —
+`WHERE category = ?` can seek on the composite, and `nconst` is already
+ordered within each category for the grouping). The takeaway for generated
+SQL: index *query patterns*, not just columns — a composite on
+`(filter_col, group_or_join_col)` beats two single-column indexes for the
+filter-then-aggregate shape, because SQLite can typically use only one index
+per table per query.
+
 ---
 
 ## 🛡️ License
