@@ -15,6 +15,7 @@ Run:  python -m evals.run_evals --mock
       python -m evals.run_evals --model llama3.1 --top-k 5
       python -m evals.run_evals --mock --junit reports/junit.xml
       python -m evals.run_evals --mock --fail-under 95   # CI gate: fail unless accuracy >= 95%
+                                                     # (prints a JSON verdict line first)
 """
 import argparse
 import json
@@ -71,11 +72,17 @@ def gate_exit(passed: int, total: int, fail_under: float | None) -> int:
     No gate: exit 0 only if every question passed.
     --fail-under PCT: exit 0 iff execution accuracy >= PCT (CI gate); a few
     individual failures are tolerated as long as the threshold is met.
+
+    The gated path also prints a machine-readable JSON verdict line first, so
+    CI dashboards can consume the gate result without parsing prose:
+    {"accuracy": 96.0, "fail_under": 95, "ok": true}
     """
     if fail_under is None:
         return 0 if passed == total else 1
     acc = 100.0 * passed / total if total else 0.0
-    if acc < fail_under:
+    ok = acc >= fail_under
+    print(json.dumps({"accuracy": round(acc, 1), "fail_under": fail_under, "ok": ok}))
+    if not ok:
         print(f"FAIL: accuracy {acc:.1f}% is below --fail-under {fail_under}%")
         return 1
     print(f"OK: accuracy {acc:.1f}% meets --fail-under {fail_under}%")
