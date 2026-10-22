@@ -16,8 +16,17 @@ Run:  python -m evals.run_evals --mock
       python -m evals.run_evals --mock --junit reports/junit.xml
       python -m evals.run_evals --mock --fail-under 95   # CI gate: fail unless accuracy >= 95%
                                                      # (prints a JSON verdict line first)
+      python -m evals.run_evals --mock --json reports/verdict.json
+                                                     # archive verdict + per-question results as JSON
+      python -m evals.run_evals --mock --no-history  # local debug: no history row recorded
+
+Every run also appends a one-row summary to reports/daily/eval_history.csv
+(unless --no-history is given), so eval accuracy over time can be charted
+without re-running history.
 """
 import argparse
+import csv
+import datetime
 import json
 import os
 import sys
@@ -33,6 +42,10 @@ from core.rag_engine import generate_sql_query
 from core.llm import make_llm
 
 GOLDEN_PATH = os.path.join(os.path.dirname(__file__), "golden.json")
+
+# Where every eval run appends its one-row summary (date, passed, total,
+# accuracy_pct, llm) — a running history of golden-eval scores.
+EVAL_HISTORY_PATH = "reports/daily/eval_history.csv"
 
 
 def normalize(value):
@@ -66,6 +79,17 @@ class MockLLM:
         return "```sql\nSELECT 1\n```"
 
 
+def verdict_dict(passed: int, total: int, fail_under: float | None) -> dict:
+    """Machine-readable gate verdict: {"accuracy", "fail_under", "ok"}.
+
+    fail_under=None means "no gate" → ok iff every question passed.
+    accuracy is execution accuracy in percent, rounded to 1 decimal.
+    """
+    acc = 100.0 * passed / total if total else 0.0
+    ok = (passed == total) if fail_under is None else acc >= fail_under
+    return {"accuracy": round(acc, 1), "fail_under": fail_under, "ok": ok}
+
+
 def gate_exit(passed: int, total: int, fail_under: float | None) -> int:
     """Map eval results to a process exit code.
 
@@ -80,16 +104,34 @@ def gate_exit(passed: int, total: int, fail_under: float | None) -> int:
     if fail_under is None:
         return 0 if passed == total else 1
     acc = 100.0 * passed / total if total else 0.0
-    ok = acc >= fail_under
-    print(json.dumps({"accuracy": round(acc, 1), "fail_under": fail_under, "ok": ok}))
-    if not ok:
+    verdict = verdict_dict(passed, total, fail_under)
+    print(json.dumps(verdict))
+    if not verdict["ok"]:
         print(f"FAIL: accuracy {acc:.1f}% is below --fail-under {fail_under}%")
         return 1
     print(f"OK: accuracy {acc:.1f}% meets --fail-under {fail_under}%")
     return 0
 
 
-def main() -> int:
+def record_eval_history(date_str: str, passed: int, total: int,
+                        accuracy: float, llm: str | None = None,
+                        path: str = EVAL_HISTORY_PATH) -> None:
+    """Append one row for this eval run to the history CSV.
+
+    Writes the header ``date,passed,total,accuracy_pct,llm`` when the file
+    does not exist yet. Parent directories are created as needed.
+    """
+    exists = os.path.exists(path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not exists:
+            writer.writerow(["date", "passed", "total", "accuracy_pct", "llm"])
+        writer.writerow([date_str, passed, total, round(accuracy, 1), llm or ""])
+
+
+def parse_args(argv=None):
+    """CLI parser for run_evals; factored out so tests can probe the flags."""
     parser = argparse.ArgumentParser(description="SQL RAG execution-accuracy evals")
     parser.add_argument("--mock", action="store_true", help="use deterministic mock LLM (harness self-test)")
     parser.add_argument("--model", default="llama3.1", help="Ollama model for real runs")
@@ -103,7 +145,22 @@ def main() -> int:
     parser.add_argument("--fail-under", type=float, default=None, metavar="PCT",
                         help="CI gate: exit non-zero unless execution accuracy is "
                              "at least PCT%% (e.g. --fail-under 95)")
-    args = parser.parse_args()
+    parser.add_argument("--json", default=None, metavar="PATH",
+                        help="write the gate verdict (accuracy, fail_under, ok) plus "
+                             "per-question results as JSON to PATH, for CI build artifacts")
+    parser.add_argument("--no-history", action="store_true", default=False,
+                        help="skip recording this run in reports/daily/eval_history.csv "
+                             "(local debugging; CI/workflow runs should record)")
+    args = parser.parse_args(argv)
+    if args.fail_under is not None and not 0 <= args.fail_under <= 100:
+        parser.error(f"--fail-under must be between 0 and 100 (got {args.fail_under})")
+    if args.top_k <= 0:
+        parser.error(f"--top-k must be a positive integer (got {args.top_k})")
+    return args
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
 
     with open(GOLDEN_PATH, encoding="utf-8") as f:
         golden = json.load(f)
@@ -146,11 +203,45 @@ def main() -> int:
     print("-" * 48)
     print(f"Execution accuracy: {passed}/{n} ({acc:.1f}%)  [llm={llm.label}]")
 
+    if args.no_history:
+        print("history recording skipped (--no-history)")
+    else:
+        try:
+            record_eval_history(datetime.date.today().isoformat(), passed, n,
+                                acc, llm=llm.label)
+        except Exception as e:
+            # History is informational only: never fail an eval run over it.
+            print(f"warning: could not record eval history: {e}")
+
     if args.junit:
         write_junit(args.junit, cases, llm.label)
         print(f"JUnit report written to {args.junit}")
 
+    if args.json:
+        verdict = verdict_dict(passed, n, args.fail_under)
+        artifact = {
+            **verdict,
+            "passed": passed,
+            "total": n,
+            "llm": llm.label,
+            "results": [
+                {"id": qid, "ok": ok, "detail": detail,
+                 "elapsed_s": round(elapsed, 3)}
+                for qid, ok, detail, elapsed in cases
+            ],
+        }
+        write_json(args.json, artifact)
+        print(f"Verdict JSON written to {args.json}")
+
     return gate_exit(passed, n, args.fail_under)
+
+
+def write_json(path: str, payload: dict) -> None:
+    """Write a JSON artifact (stdlib only), creating parent dirs as needed."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
 
 
 def write_junit(path: str, cases: list, llm_label: str) -> None:
