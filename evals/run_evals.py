@@ -20,6 +20,9 @@ Run:  python -m evals.run_evals --mock
                                                      # archive verdict + per-question results as JSON
       python -m evals.run_evals --mock --no-history  # local debug: no history row recorded
 
+  An explicitly-passed --db must exist and be readable: a typo'd path fails
+  fast (exit 2) instead of silently eval'ing a freshly-initialized sample DB.
+
 Every run also appends a one-row summary to reports/daily/eval_history.csv
 (unless --no-history is given), so eval accuracy over time can be charted
 without re-running history.
@@ -139,7 +142,10 @@ def parse_args(argv=None):
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--api-key", default="")
     parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--db", default=DEFAULT_DB_PATH)
+    parser.add_argument("--db", default=DEFAULT_DB_PATH,
+                        help="SQLite database to eval against (must exist and be "
+                             "readable when passed explicitly; the default is "
+                             "auto-initialized as the sample DB)")
     parser.add_argument("--junit", default=None, metavar="PATH",
                         help="write JUnit XML report to PATH for CI integration")
     parser.add_argument("--fail-under", type=float, default=None, metavar="PCT",
@@ -156,6 +162,17 @@ def parse_args(argv=None):
         parser.error(f"--fail-under must be between 0 and 100 (got {args.fail_under})")
     if args.top_k <= 0:
         parser.error(f"--top-k must be a positive integer (got {args.top_k})")
+    # An explicitly-passed --db must point at a real, readable database file.
+    # main() auto-initializes the *default* DB on a fresh checkout, so the
+    # default is exempt: only a deliberate --db with a typo'd path fails fast
+    # instead of silently eval'ing a freshly-initialized sample DB.
+    raw = sys.argv[1:] if argv is None else argv
+    if any(tok == "--db" or tok.startswith("--db=") for tok in raw):
+        if not os.path.isfile(args.db):
+            parser.error(f"--db '{args.db}' does not exist or is not a file; "
+                         "pass the path to an existing SQLite database")
+        elif not os.access(args.db, os.R_OK):
+            parser.error(f"--db '{args.db}' is not readable")
     return args
 
 
