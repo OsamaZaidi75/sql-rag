@@ -1,5 +1,6 @@
 """Unit tests for the --fail-under CI gate, --json verdict artifact,
---no-history flag, --top-k validation, and eval-history CSV in evals/run_evals.py."""
+--no-history flag, --top-k and --db validation, and eval-history CSV
+in evals/run_evals.py."""
 import csv
 import json
 
@@ -173,3 +174,33 @@ def test_top_k_accepts_positive():
     """1 is the smallest meaningful retrieval depth; the default is untouched."""
     assert parse_args(["--top-k", "1"]).top_k == 1
     assert parse_args(["--mock"]).top_k == 5
+
+
+def test_db_rejects_missing_file(capsys):
+    """A typo'd --db path must not silently eval a fresh empty sample DB."""
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["--db", "/tmp/definitely-not-a-real-db-xyz.db"])
+    assert exc.value.code == 2
+    assert "does not exist or is not a file" in capsys.readouterr().err
+
+
+def test_db_rejects_directory(capsys, tmp_path):
+    """A directory is not a database file."""
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["--db", str(tmp_path)])
+    assert exc.value.code == 2
+    assert "does not exist or is not a file" in capsys.readouterr().err
+
+
+def test_db_accepts_existing_file(tmp_path):
+    """An existing readable file passes validation untouched."""
+    db = tmp_path / "mine.db"
+    db.write_bytes(b"")
+    assert parse_args(["--db", str(db)]).db == str(db)
+
+
+def test_db_default_not_validated_when_implicit(tmp_path, monkeypatch):
+    """The default --db is auto-initialized by main(); an unset flag must
+    never fail even when data/sample.db does not exist yet (fresh clone)."""
+    monkeypatch.chdir(tmp_path)
+    assert parse_args(["--mock"]).db == "data/sample.db"
