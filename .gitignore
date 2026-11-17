@@ -20,6 +20,17 @@ htmlcov/
 # SQLite databases
 data/*.db
 
+# Vector-index cache (rebuilt automatically when the DB changes)
+data/index_cache/
+
+# Frontend build output and dependencies
+frontend/dist/
+frontend/node_modules/
+
+# Local environment (API keys live here at runtime, never in the repo)
+.env
+.env.*
+
 # OS
 .DS_Store
 Thumbs.db

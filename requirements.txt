@@ -16,3 +16,10 @@ pytest==9.1.1
 sqlglot==30.21.0
 rank-bm25==0.2.2
 faker==40.41.0
+
+# FastAPI backend + React frontend host (added 2026-11-18, verified with the
+# API test suite in tests/test_api.py). httpx is needed by FastAPI's
+# TestClient.
+fastapi==0.163.2
+uvicorn==0.54.0
+httpx==0.28.1
