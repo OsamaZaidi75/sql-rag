@@ -24,6 +24,7 @@ from core.database import (
     explain_query_plan,
     DEFAULT_DB_PATH
 )
+from core.embeddings import DEFAULT_EMBEDDING_MODEL
 from core.vector_store import (
     VectorStore,
     get_or_build_index,
@@ -137,9 +138,21 @@ def get_installed_ollama_models() -> List[str]:
 
 # --- Cached Vector Store Resource ---
 @st.cache_resource(show_spinner=False)
-def get_cached_vector_store(db_path: str, backend: str, ollama_embed_model: str) -> VectorStore:
+def get_cached_vector_store(
+    db_path: str,
+    backend: str,
+    ollama_embed_model: str,
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+    api_key: str = "",
+) -> VectorStore:
     """Builds the vector store, or loads it from the disk cache when the DB is unchanged."""
-    return get_or_build_index(db_path, backend=backend, ollama_embed_model=ollama_embed_model)
+    return get_or_build_index(
+        db_path,
+        backend=backend,
+        ollama_embed_model=ollama_embed_model,
+        embedding_model=embedding_model,
+        api_key=api_key,
+    )
 
 
 # Initialize sample DB on start
@@ -195,12 +208,12 @@ with st.sidebar:
     # Embedding Backend Selection
     embedding_backend = st.selectbox(
         "Embedding Provider",
-        options=["auto", "ollama", "sentence-transformers", "tfidf"],
+        options=["auto", "nvidia", "ollama", "tfidf"],
         index=0,
         format_func=lambda x: {
             "auto": "Auto-Detect (Best Available)",
+            "nvidia": "NVIDIA API (hosted, no local weights)",
             "ollama": "Ollama (nomic-embed-text)",
-            "sentence-transformers": "SentenceTransformers (BGE/MiniLM)",
             "tfidf": "TF-IDF (Offline, 0-Latency)"
         }.get(x, x),
         help="Backend used to semantically index database tables, columns, and sample values"
@@ -209,6 +222,16 @@ with st.sidebar:
     ollama_embed_model = "nomic-embed-text"
     if embedding_backend == "ollama":
         ollama_embed_model = st.text_input("Ollama Embed Model", value="nomic-embed-text")
+
+    embedding_model = os.environ.get("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+    nvidia_embed_key = ""
+    if embedding_backend in ("auto", "nvidia"):
+        embedding_model = st.text_input("NVIDIA Embedding Model", value=embedding_model)
+        nvidia_embed_key = st.text_input(
+            "NVIDIA API Key (embeddings)",
+            type="password",
+            help="Kept in memory only. Falls back to NVIDIA_API_KEY from the environment when blank.",
+        )
 
     # Hyperparameters
     col_k, col_temp = st.columns(2)
@@ -316,7 +339,10 @@ if not os.path.exists(current_db):
     st.stop()
 
 with st.spinner("Indexing database schema with vector embeddings..."):
-    vector_store = get_cached_vector_store(current_db, embedding_backend, ollama_embed_model)
+    vector_store = get_cached_vector_store(
+        current_db, embedding_backend, ollama_embed_model,
+        embedding_model=embedding_model, api_key=nvidia_embed_key,
+    )
 
 # Active backend indicator
 st.markdown(

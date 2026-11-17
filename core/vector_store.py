@@ -1,7 +1,12 @@
 """
 Hybrid Vector Store & Schema Indexer for SQL RAG
-Supports multiple embedding backends (Ollama, SentenceTransformers, TF-IDF fallback)
+Supports multiple embedding backends (NVIDIA API, Ollama, TF-IDF fallback)
 with automatic failover, batch processing, and normalized cosine similarity search.
+
+Dense embeddings come from NVIDIA's hosted embedding models by default
+(see :mod:`core.embeddings`); no local model weights are downloaded, which
+is what keeps the Docker image slim. Ollama stays as a local option and
+TF-IDF as the fully offline fallback.
 
 Retrieval is genuinely hybrid: dense cosine similarity and BM25 keyword search
 run independently and their ranked lists are fused with Reciprocal Rank Fusion
@@ -9,8 +14,10 @@ run independently and their ranked lists are fused with Reciprocal Rank Fusion
 each other instead of one backend merely replacing the other.
 
 The built index can be persisted to disk and reloaded when the underlying
-database file has not changed (checked via mtime), so restarts don't pay
-the embedding cost again.
+database file has not changed (checked via mtime) and the embedding model
+matches the manifest, so restarts don't pay the embedding cost again.
+A cached index built with a different model (different vector dimension)
+is never reused — it is rebuilt.
 """
 
 import json
@@ -21,6 +28,8 @@ import numpy as np
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Optional
 from dataclasses import dataclass, field, asdict
+
+from .embeddings import DEFAULT_EMBEDDING_MODEL, NvidiaEmbeddingClient
 
 
 def _tokenize(text: str) -> List[str]:
@@ -47,30 +56,58 @@ class DocumentChunk:
     doc_id: str = ""
 
 
+VALID_BACKENDS = ("auto", "nvidia", "ollama", "tfidf")
+
+
 class VectorStore:
     """Hybrid dense + BM25 vector store for schema chunks.
 
-    Embedding backends are tried in order (Ollama, then SentenceTransformers,
-    then a TF-IDF char-ngram fallback) so the store works fully offline.
-    All backends return L2-normalized vectors, so ``np.dot`` gives cosine
-    similarity directly. Dense rankings and BM25 keyword rankings can be
-    fused with :meth:`search_hybrid` via Reciprocal Rank Fusion.
+    Embedding backends are tried in order (NVIDIA API, then Ollama, then
+    a TF-IDF char-ngram fallback) so the store works with or without a
+    network. All backends return L2-normalized vectors, so ``np.dot`` gives
+    cosine similarity directly. Dense rankings and BM25 keyword rankings can
+    be fused with :meth:`search_hybrid` via Reciprocal Rank Fusion.
     """
 
-    def __init__(self, backend: str = "auto", ollama_model: str = "nomic-embed-text", hf_model: str = "BAAI/bge-small-en-v1.5"):
+    def __init__(
+        self,
+        backend: str = "auto",
+        ollama_model: str = "nomic-embed-text",
+        embedding_model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        embedding_base_url: Optional[str] = None,
+    ):
         """Initialize the store and pick the best available embedding backend.
 
         Args:
-            backend: One of ``"auto"``, ``"ollama"``, ``"sentence-transformers"``,
-                or ``"tfidf"``. ``"auto"`` tries them in order and falls back.
+            backend: One of ``"auto"``, ``"nvidia"``, ``"ollama"``, or
+                ``"tfidf"``. ``"auto"`` tries them in order and falls back.
+                (``"sentence-transformers"`` was removed 2026-11-18: dense
+                embeddings now come from the NVIDIA API instead of local
+                torch weights.)
             ollama_model: Ollama embedding model used when backend is ollama.
-            hf_model: HuggingFace model id used for sentence-transformers.
+            embedding_model: NVIDIA embedding model id; defaults to the
+                ``EMBEDDING_MODEL`` env var, then
+                ``nvidia/nemotron-3.5-embed-8b``.
+            api_key: NVIDIA API key; defaults to ``NVIDIA_API_KEY`` (or
+                ``LLM_API_KEY``) from the environment.
+            embedding_base_url: Embeddings endpoint base URL; defaults to
+                the NVIDIA API.
         """
-        self.backend = backend  # 'ollama', 'sentence-transformers', 'tfidf', 'auto'
+        if backend not in VALID_BACKENDS:
+            raise ValueError(
+                f"Unknown embedding backend {backend!r}; "
+                f"expected one of {', '.join(VALID_BACKENDS)}"
+            )
+        self.backend = backend  # 'nvidia', 'ollama', 'tfidf', 'auto'
         self.ollama_model = ollama_model
-        self.hf_model_name = hf_model
+        self.embedding_model = embedding_model or os.environ.get(
+            "EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL
+        )
+        self._api_key = api_key
+        self._embedding_base_url = embedding_base_url
         self.active_backend = "tfidf"
-        self._hf_model = None
+        self._embed_client: Optional[NvidiaEmbeddingClient] = None
         self._tfidf_vectorizer = None
         self._bm25 = None
 
@@ -78,8 +115,29 @@ class VectorStore:
         self.embeddings: Optional[np.ndarray] = None
         self._initialize_backend()
 
+    def _make_embed_client(self) -> NvidiaEmbeddingClient:
+        if self._embed_client is None:
+            self._embed_client = NvidiaEmbeddingClient(
+                model=self.embedding_model,
+                api_key=self._api_key,
+                base_url=self._embedding_base_url,
+            )
+        return self._embed_client
+
     def _initialize_backend(self):
         """Discovers and initializes the best available embedding engine."""
+        if self.backend in ("nvidia", "auto"):
+            try:
+                client = self._make_embed_client()
+                if client.api_key:
+                    probe = client.embed(["schema test"], input_type="passage")
+                    if probe.shape[0] == 1 and probe.shape[1] > 0:
+                        self.active_backend = "nvidia"
+                        return
+            except Exception:
+                if self.backend == "nvidia":
+                    pass
+
         if self.backend in ("ollama", "auto"):
             try:
                 import ollama
@@ -92,16 +150,6 @@ class VectorStore:
                 if self.backend == "ollama":
                     pass
 
-        if self.backend in ("sentence-transformers", "auto"):
-            try:
-                from sentence_transformers import SentenceTransformer
-                self._hf_model = SentenceTransformer(self.hf_model_name)
-                self.active_backend = "sentence-transformers"
-                return
-            except Exception:
-                if self.backend == "sentence-transformers":
-                    pass
-
         # Fallback to TF-IDF (100% offline, zero network, zero crash)
         self.active_backend = "tfidf"
 
@@ -109,6 +157,15 @@ class VectorStore:
         """Embeds a list of texts using the active backend."""
         if not texts:
             return np.empty((0, 0))
+
+        if self.active_backend == "nvidia":
+            try:
+                return self._make_embed_client().embed(texts, input_type="passage")
+            except Exception:
+                # Fallback to TF-IDF
+                self.active_backend = "tfidf"
+                if self.chunks:
+                    self.build_index()
 
         if self.active_backend == "ollama":
             try:
@@ -122,18 +179,6 @@ class VectorStore:
                     return arr / norms
             except Exception:
                 # Fallback to TF-IDF
-                self.active_backend = "tfidf"
-                if self.chunks:
-                    self.build_index()
-
-        if self.active_backend == "sentence-transformers":
-            try:
-                if self._hf_model is None:
-                    from sentence_transformers import SentenceTransformer
-                    self._hf_model = SentenceTransformer(self.hf_model_name)
-                arr = self._hf_model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
-                return np.array(arr, dtype=np.float32)
-            except Exception:
                 self.active_backend = "tfidf"
                 if self.chunks:
                     self.build_index()
@@ -161,6 +206,16 @@ class VectorStore:
             q_vec = self._tfidf_vectorizer.transform([query]).toarray()
             q_norm = np.linalg.norm(q_vec, axis=1, keepdims=True) + 1e-9
             return (q_vec / q_norm).astype(np.float32)
+        if self.active_backend == "nvidia":
+            try:
+                # Queries use input_type="query" (required by the 8b model);
+                # indexed documents use "passage" (see _embed_texts).
+                return self._make_embed_client().embed_query(query)
+            except Exception:
+                self.active_backend = "tfidf"
+                if self.chunks:
+                    self.build_index()
+                return self._embed_query(query)
         return self._embed_texts([query])
 
     def add_chunk(self, text: str, metadata: Dict[str, Any], doc_id: str = ""):
@@ -287,6 +342,13 @@ class VectorStore:
             json.dump([asdict(c) for c in self.chunks], f)
         manifest = {
             "active_backend": self.active_backend,
+            # The model that produced these vectors. A cached index is only
+            # reused when this matches the requested model: a new model
+            # means a new vector dimension, so a stale cache must rebuild
+            # rather than serve wrong-shaped vectors.
+            "embedding_model": (
+                self.embedding_model if self.active_backend == "nvidia" else None
+            ),
             "embedding_dim": int(self.embeddings.shape[1]),
             "chunk_count": len(self.chunks),
             "db_mtime": db_mtime,
@@ -299,7 +361,12 @@ class VectorStore:
 
     @classmethod
     def load_index(cls, base_path: str, **kwargs) -> "VectorStore":
-        """Reloads an index previously written by :meth:`save_index`."""
+        """Reloads an index previously written by :meth:`save_index`.
+
+        Raises ``ValueError`` when the stored vectors don't match the
+        manifest's dimension (e.g. a cache written by a different model),
+        so callers rebuild instead of serving wrong-shaped vectors.
+        """
         base = str(base_path)
         with open(base + ".json", encoding="utf-8") as f:
             manifest = json.load(f)
@@ -309,13 +376,25 @@ class VectorStore:
         store = cls.__new__(cls)
         store.backend = kwargs.get("backend", "auto")
         store.ollama_model = kwargs.get("ollama_model", "nomic-embed-text")
-        store.hf_model_name = kwargs.get("hf_model", "BAAI/bge-small-en-v1.5")
+        store.embedding_model = (
+            kwargs.get("embedding_model")
+            or manifest.get("embedding_model")
+            or os.environ.get("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+        )
+        store._api_key = kwargs.get("api_key")
+        store._embedding_base_url = kwargs.get("embedding_base_url")
         store.active_backend = manifest.get("active_backend", "tfidf")
-        store._hf_model = None
+        store._embed_client = None
         store._tfidf_vectorizer = None
         store._bm25 = None
         store.chunks = [DocumentChunk(**c) for c in chunk_dicts]
         store.embeddings = np.load(base + ".npz")["embeddings"]
+        manifest_dim = manifest.get("embedding_dim")
+        if manifest_dim is not None and store.embeddings.shape[1] != manifest_dim:
+            raise ValueError(
+                f"Cached index dim {store.embeddings.shape[1]} != "
+                f"manifest dim {manifest_dim}; rebuild required"
+            )
 
         if store.active_backend == "tfidf":
             tfidf_path = base + ".tfidf.pkl"
@@ -342,29 +421,55 @@ def get_or_build_index(
     backend: str = "auto",
     ollama_embed_model: str = "nomic-embed-text",
     cache_dir: str = "data/index_cache",
+    embedding_model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    embedding_base_url: Optional[str] = None,
 ) -> VectorStore:
     """
     Returns a built VectorStore for ``db_path``, loading a cached index from
-    disk when the database file is unchanged (mtime check), otherwise building
-    fresh and caching it.
+    disk when the database file is unchanged (mtime check) and the cached
+    embedding model matches the requested one, otherwise building fresh and
+    caching it. A model change (new vector dimension) always rebuilds.
     """
     os.makedirs(cache_dir, exist_ok=True)
     base = index_cache_path(db_path, backend, cache_dir)
     manifest_path = base + ".json"
     db_mtime = os.path.getmtime(db_path) if os.path.exists(db_path) else None
+    wanted_model = embedding_model or os.environ.get(
+        "EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL
+    )
 
     if os.path.exists(manifest_path) and db_mtime is not None:
         try:
             with open(manifest_path, encoding="utf-8") as f:
                 manifest = json.load(f)
-            if manifest.get("db_mtime") == db_mtime and manifest.get("chunk_count"):
+            model_ok = (
+                manifest.get("active_backend") != "nvidia"
+                or manifest.get("embedding_model") == wanted_model
+            )
+            if (
+                manifest.get("db_mtime") == db_mtime
+                and manifest.get("chunk_count")
+                and model_ok
+            ):
                 return VectorStore.load_index(
-                    base, backend=backend, ollama_model=ollama_embed_model
+                    base,
+                    backend=backend,
+                    ollama_model=ollama_embed_model,
+                    embedding_model=wanted_model,
+                    api_key=api_key,
+                    embedding_base_url=embedding_base_url,
                 )
         except Exception:
-            pass  # corrupt/partial cache -> rebuild
+            pass  # corrupt/partial/stale cache -> rebuild
 
-    store = VectorStore(backend=backend, ollama_model=ollama_embed_model)
+    store = VectorStore(
+        backend=backend,
+        ollama_model=ollama_embed_model,
+        embedding_model=wanted_model,
+        api_key=api_key,
+        embedding_base_url=embedding_base_url,
+    )
     index_database_schema(db_path, store)
     try:
         store.save_index(base, db_mtime=db_mtime)

@@ -153,6 +153,9 @@ class Engine:
                         self.settings.db_path,
                         backend=self.settings.embedding_backend,
                         ollama_embed_model=self.settings.ollama_embed_model,
+                        embedding_model=self.settings.embedding_model,
+                        # Same key as the LLM; empty when unset (tfidf fallback).
+                        api_key=self.settings.llm_api_key,
                     )
         return self._store
 

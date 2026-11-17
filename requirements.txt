@@ -2,11 +2,14 @@
 # `==` pins are the exact `pip freeze` versions the daily test suite
 # (pytest tests/ → 60 passed, 2 skipped) and golden eval
 # (evals/run_evals.py --mock → 30/30) are verified against.
-# streamlit and sentence-transformers keep lower bounds: their wheels are
-# too heavy for the test venv, so they aren't installed when tests run.
-# Pin them too if you need a byte-reproducible UI/embedding setup.
+# streamlit keeps a lower bound: its wheel is too heavy for the test venv,
+# so it isn't installed when tests run. Pin it too if you need a
+# byte-reproducible UI setup.
+# NOTE 2026-11-18: sentence-transformers (and torch) were REMOVED — dense
+# embeddings now come from the NVIDIA API (core/embeddings.py, stdlib-only
+# HTTP), which cut the Docker image from 10.5 GB to well under 1 GB.
+# Do not re-add local embedding weights; use EMBEDDING_MODEL instead.
 streamlit>=1.38.0
-sentence-transformers>=2.2.0
 scikit-learn==1.9.1
 numpy==2.5.3
 pandas==3.0.6

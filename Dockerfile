@@ -1,6 +1,9 @@
 # SQL RAG Studio — single container: FastAPI backend + built React frontend.
 # Multi-arch safe: node:22-alpine and python:3.12-slim both ship ARM64 images,
 # and all Python deps have aarch64 wheels (no compilation step).
+# Embeddings come from the NVIDIA API (no local model weights in the image),
+# which keeps this image well under 1 GB. Built for linux/arm64 by
+# .github/workflows/docker.yml and published to GHCR.
 #
 # Run:
 #   docker build -t sql-rag .

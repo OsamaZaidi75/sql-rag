@@ -5,7 +5,7 @@ designed React studio on top: ask a plain-English question, get SQL you can
 read, run, and trust — with hybrid semantic retrieval, schema pruning, and
 layered safety guardrails over SQLite.
 
-**Hosted demo:** https://sql-rag.129-80-41-146.nip.io/
+**Hosted demo:** https://sql-rag.osamazaidi.com/
 
 Translate complex natural language questions into accurate, performant, and
 safe SQLite queries with instant results, an EXPLAIN plan viewer, AI
@@ -107,7 +107,8 @@ never logs or returns key material.
 | `LLM_BASE_URL` | `https://integrate.api.nvidia.com/v1` | OpenAI-compatible endpoint. Point elsewhere (e.g. AgentRouter `https://agentrouter.org/v1`) to use another provider. |
 | `LLM_MODEL` | `nvidia/nemotron-3-ultra-550b-a55b` (cloud) / `llama3.1` (Ollama) | Model id for the selected provider. |
 | `LLM_TIMEOUT_SECS` | `180` | Per-call LLM timeout. |
-| `EMBEDDING_BACKEND` | `tfidf` | `tfidf` (offline, deterministic — the deploy default), `auto`, `ollama`, `sentence-transformers`. |
+| `EMBEDDING_BACKEND` | `nvidia` | `nvidia` (hosted NVIDIA embeddings — the deploy default), `auto` (NVIDIA → Ollama → TF-IDF), `ollama`, `tfidf` (offline, deterministic). Any backend falls back to TF-IDF when its engine is unavailable. |
+| `EMBEDDING_MODEL` | `nvidia/nemotron-3.5-embed-8b` | NVIDIA embedding model (4096-dim). Fallback: `nvidia/nemotron-3-embed-1b` (2048-dim). Changing the model rebuilds the cached index (new vector dimension). |
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server (read by the `ollama` client). |
 | `SQLRAG_DB_PATH` | `data/sample.db` | SQLite database to query. |
 | `SQLRAG_MAX_ROWS` | `500` | Row cap injected into every query. |

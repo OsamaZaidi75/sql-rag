@@ -19,10 +19,14 @@ LLM provider selection (``LLM_PROVIDER``):
 - ``auto`` (default) — ``cloud`` when an API key is present in the
   environment, otherwise ``ollama``.
 
-Embeddings (``EMBEDDING_BACKEND``, default ``tfidf``): ``tfidf`` is fully
-offline and deterministic — no model downloads, which is what the deploy
-target wants. ``auto`` tries Ollama embeddings (``nomic-embed-text``), then
-SentenceTransformers, then TF-IDF.
+Embeddings (``EMBEDDING_BACKEND``, default ``nvidia``): dense vectors come
+from NVIDIA's hosted embedding models (``EMBEDDING_MODEL``, default
+``nvidia/nemotron-3.5-embed-8b``) over the same ``NVIDIA_API_KEY`` as the
+LLM — no local model weights, which is what keeps the Docker image slim.
+``auto`` tries NVIDIA, then Ollama embeddings (``nomic-embed-text``), then
+TF-IDF. ``tfidf`` is fully offline and deterministic. Any backend falls
+back to TF-IDF when its engine is unavailable (no key, no server), so the
+API still answers.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ import os
 from dataclasses import dataclass
 
 from core.database import DEFAULT_DB_PATH
+from core.embeddings import DEFAULT_EMBEDDING_MODEL
 
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 AGENTROUTER_BASE_URL = "https://agentrouter.org/v1"
@@ -47,7 +52,8 @@ class Settings:
     llm_base_url: str = NVIDIA_BASE_URL
     llm_api_key: str = ""  # never logged, never returned by the API
     llm_timeout_secs: int = 180
-    embedding_backend: str = "tfidf"
+    embedding_backend: str = "nvidia"
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
     ollama_embed_model: str = "nomic-embed-text"
     max_rows: int = 500
     query_timeout_secs: float = 15.0
@@ -69,6 +75,7 @@ class Settings:
             "llm_key_configured": bool(self.llm_api_key),
             "llm_timeout_secs": self.llm_timeout_secs,
             "embedding_backend": self.embedding_backend,
+            "embedding_model": self.embedding_model,
             "max_rows": self.max_rows,
             "query_timeout_secs": self.query_timeout_secs,
         }
@@ -119,7 +126,8 @@ def load_settings() -> Settings:
         llm_base_url=base_url,
         llm_api_key=api_key,
         llm_timeout_secs=_env_int("LLM_TIMEOUT_SECS", 180),
-        embedding_backend=os.environ.get("EMBEDDING_BACKEND", "tfidf"),
+        embedding_backend=os.environ.get("EMBEDDING_BACKEND", "nvidia"),
+        embedding_model=os.environ.get("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
         ollama_embed_model=os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
         max_rows=_env_int("SQLRAG_MAX_ROWS", 500),
         query_timeout_secs=_env_float("SQLRAG_QUERY_TIMEOUT_SECS", 15.0),
