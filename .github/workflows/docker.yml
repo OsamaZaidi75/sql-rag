@@ -1,0 +1,48 @@
+name: docker
+
+# Build the SQL RAG Studio image and push it to GHCR. The deploy target is
+# an Oracle ARM64 VM, so the image MUST be linux/arm64 (built here with
+# QEMU + buildx — never built on the 2-CPU VM, where it took 20+ minutes).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ghcr.io/osamazaidi75/sql-rag:latest
+            ghcr.io/osamazaidi75/sql-rag:${{ github.sha }}
+
+      # First push creates the package as private; the VM pulls anonymously,
+      # so flip it to public. Best effort only — if this fails, the deployer
+      # tests the anonymous pull and flips visibility in the repo settings.
+      - name: Make package public (best effort)
+        continue-on-error: true
+        run: gh api -X PATCH /user/packages/container/sql-rag -f visibility=public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
